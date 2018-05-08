@@ -33,26 +33,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/domodwyer/mgo/bson"
+	"github.com/globalsign/mgo/bson"
 )
 
 type replyFunc func(err error, reply *replyOp, docNum int, docData []byte)
 
 type mongoSocket struct {
 	sync.Mutex
-	server        *mongoServer // nil when cached
-	conn          net.Conn
-	timeout       time.Duration
-	addr          string // For debugging only.
-	nextRequestId uint32
-	replyFuncs    map[uint32]replyFunc
-	references    int
-	creds         []Credential
-	logout        []Credential
-	cachedNonce   string
-	gotNonce      sync.Cond
-	dead          error
-	serverInfo    *mongoServerInfo
+	server         *mongoServer // nil when cached
+	conn           net.Conn
+	timeout        time.Duration
+	addr           string // For debugging only.
+	nextRequestId  uint32
+	replyFuncs     map[uint32]replyFunc
+	references     int
+	creds          []Credential
+	logout         []Credential
+	cachedNonce    string
+	gotNonce       sync.Cond
+	dead           error
+	serverInfo     *mongoServerInfo
+	closeAfterIdle bool
+	lastTimeUsed   time.Time // for time based idle socket release
+	sendMeta       sync.Once
 }
 
 type queryOpFlags uint32
@@ -67,30 +70,31 @@ const (
 )
 
 type queryOp struct {
-	query      interface{}
-	collection string
-	serverTags []bson.D
-	selector   interface{}
-	replyFunc  replyFunc
-	mode       Mode
-	skip       int32
-	limit      int32
-	options    queryWrapper
-	hasOptions bool
-	flags      queryOpFlags
+	query       interface{}
+	collection  string
+	serverTags  []bson.D
+	selector    interface{}
+	replyFunc   replyFunc
+	mode        Mode
+	skip        int32
+	limit       int32
+	options     queryWrapper
+	hasOptions  bool
+	flags       queryOpFlags
+	readConcern string
 }
 
 type queryWrapper struct {
-	Query          interface{} "$query"
-	OrderBy        interface{} "$orderby,omitempty"
-	Hint           interface{} "$hint,omitempty"
-	Explain        bool        "$explain,omitempty"
-	Snapshot       bool        "$snapshot,omitempty"
-	ReadPreference bson.D      "$readPreference,omitempty"
-	MaxScan        int         "$maxScan,omitempty"
-	MaxTimeMS      int         "$maxTimeMS,omitempty"
-	Comment        string      "$comment,omitempty"
-	Collation      *Collation  "$collation,omitempty"
+	Query          interface{} `bson:"$query"`
+	OrderBy        interface{} `bson:"$orderby,omitempty"`
+	Hint           interface{} `bson:"$hint,omitempty"`
+	Explain        bool        `bson:"$explain,omitempty"`
+	Snapshot       bool        `bson:"$snapshot,omitempty"`
+	ReadPreference bson.D      `bson:"$readPreference,omitempty"`
+	MaxScan        int         `bson:"$maxScan,omitempty"`
+	MaxTimeMS      int         `bson:"$maxTimeMS,omitempty"`
+	Comment        string      `bson:"$comment,omitempty"`
+	Collation      *Collation  `bson:"$collation,omitempty"`
 }
 
 func (op *queryOp) finalQuery(socket *mongoSocket) interface{} {
@@ -114,9 +118,9 @@ func (op *queryOp) finalQuery(socket *mongoSocket) interface{} {
 		}
 		op.hasOptions = true
 		op.options.ReadPreference = make(bson.D, 0, 2)
-		op.options.ReadPreference = append(op.options.ReadPreference, bson.DocElem{"mode", modeName})
+		op.options.ReadPreference = append(op.options.ReadPreference, bson.DocElem{Name: "mode", Value: modeName})
 		if len(op.serverTags) > 0 {
-			op.options.ReadPreference = append(op.options.ReadPreference, bson.DocElem{"tags", op.serverTags})
+			op.options.ReadPreference = append(op.options.ReadPreference, bson.DocElem{Name: "tags", Value: op.serverTags})
 		}
 	}
 	if op.hasOptions {
@@ -267,10 +271,13 @@ func (socket *mongoSocket) Release() {
 	if socket.references == 0 {
 		stats.socketsInUse(-1)
 		server := socket.server
+		closeAfterIdle := socket.closeAfterIdle
 		socket.Unlock()
 		socket.LogoutAll()
-		// If the socket is dead server is nil.
-		if server != nil {
+		if closeAfterIdle {
+			socket.Close()
+		} else if server != nil {
+			// If the socket is dead server is nil.
 			server.RecycleSocket(socket)
 		}
 	} else {
@@ -317,6 +324,21 @@ func (socket *mongoSocket) updateDeadline(which deadlineType) {
 // Close terminates the socket use.
 func (socket *mongoSocket) Close() {
 	socket.kill(errors.New("Closed explicitly"), false)
+}
+
+// CloseAfterIdle terminates an idle socket, which has a zero
+// reference, or marks the socket to be terminate after idle.
+func (socket *mongoSocket) CloseAfterIdle() {
+	socket.Lock()
+	if socket.references == 0 {
+		socket.Unlock()
+		socket.Close()
+		logf("Socket %p to %s: idle and close.", socket, socket.addr)
+		return
+	}
+	socket.closeAfterIdle = true
+	socket.Unlock()
+	logf("Socket %p to %s: close after idle.", socket, socket.addr)
 }
 
 func (socket *mongoSocket) kill(err error, abend bool) {
@@ -529,16 +551,15 @@ func (socket *mongoSocket) Query(ops ...interface{}) (err error) {
 		socket.replyFuncs[requestId] = request.replyFunc
 		requestId++
 	}
-
+	socket.Unlock()
 	debugf("Socket %p to %s: sending %d op(s) (%d bytes)", socket, socket.addr, len(ops), len(buf))
-	stats.sentOps(len(ops))
 
+	stats.sentOps(len(ops))
 	socket.updateDeadline(writeDeadline)
 	_, err = socket.conn.Write(buf)
 	if !wasWaiting && requestCount > 0 {
 		socket.updateDeadline(readDeadline)
 	}
-	socket.Unlock()
 	return err
 }
 
